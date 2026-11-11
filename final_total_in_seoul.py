@@ -230,7 +230,7 @@ print(f"  수변 완료 ({time.time()-t1:.0f}초)")
 t1 = time.time()
 n_tree = count_in_buffer(trees, tbuf, edges.index, edges.crs)
 expected = (edges["length"] / 8 * 2).clip(lower=1)
-edges["tree"] = (n_tree / expected).clip(0, 1)
+edges["tree"] = (n_tree / expected).clip(0, 2)
 edges["signal"] = count_in_buffer(signals, sbuf, edges.index, edges.crs) / edges["length"] * 1000
 print(f"  가로수·신호 완료 ({time.time()-t1:.0f}초)")
 
