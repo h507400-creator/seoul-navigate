@@ -636,10 +636,6 @@ LEN  = np.array([G.edges[e]["length"] for e in EDGE_LIST])
 FEAT = {k: np.array([G.edges[e].get(k, 0.5) for e in EDGE_LIST])
         for k in ["fun", "tree", "green", "water", "smooth", "curve", "grade"]}
 print(f"  비용 배열 준비 완료 ({len(LEN):,}개)")
-LEN  = np.array([G.edges[e]["length"] for e in EDGE_LIST])
-FEAT = {k: np.array([G.edges[e].get(k, 0.5) for e in EDGE_LIST])
-        for k in ["fun", "tree", "green", "water", "smooth", "curve", "grade"]}
-print(f"  비용 배열 준비 완료 ({len(LEN):,}개)")
 
 # ---------- 13. 경로 탐색 검증 ----------
 if ok > 0:
