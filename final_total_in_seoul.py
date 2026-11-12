@@ -631,7 +631,11 @@ for i in range(5):
 print(f"  성공 {ok}/5")
 
 # 비용 계산용 배열 (한 번만)
-EDGE_LIST = list(G.edges(keys=True))
+EDGE_LIST = list(G.edges())
+LEN  = np.array([G.edges[e]["length"] for e in EDGE_LIST])
+FEAT = {k: np.array([G.edges[e].get(k, 0.5) for e in EDGE_LIST])
+        for k in ["fun", "tree", "green", "water", "smooth", "curve", "grade"]}
+print(f"  비용 배열 준비 완료 ({len(LEN):,}개)")
 LEN  = np.array([G.edges[e]["length"] for e in EDGE_LIST])
 FEAT = {k: np.array([G.edges[e].get(k, 0.5) for e in EDGE_LIST])
         for k in ["fun", "tree", "green", "water", "smooth", "curve", "grade"]}
