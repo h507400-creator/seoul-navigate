@@ -593,7 +593,7 @@ for r in seg.itertuples():
     n_one += one
     n_rev += rev
 
-attrs = dict(length=r.length, fun=r.fun, tree=r.tree_s,
+    attrs = dict(length=r.length, fun=r.fun, tree=r.tree_s,
              green=r.green_s, smooth=r.smooth_s, water=r.water_s,
              curve=r.curve_s, grade=r.grade_s, culture=r.culture_s,
              rank=r.road_rank,
