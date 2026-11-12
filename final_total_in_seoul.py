@@ -593,10 +593,12 @@ for r in seg.itertuples():
     n_one += one
     n_rev += rev
 
-    attrs = dict(length=r.length, fun=r.fun, tree=r.tree_s,
-                 green=r.green_s, smooth=r.smooth_s, water=r.water_s,
-                 curve=r.curve_s, grade=r.grade_s,
-                 name=r.road_name if isinstance(r.road_name, str) else "")
+attrs = dict(length=r.length, fun=r.fun, tree=r.tree_s,
+             green=r.green_s, smooth=r.smooth_s, water=r.water_s,
+             curve=r.curve_s, grade=r.grade_s, culture=r.culture_s,
+             rank=r.road_rank,
+             expwy=r.is_expwy,
+             name=r.road_name if isinstance(r.road_name, str) else "")
 
     if rev:
         G.add_edge(int(r.v), int(r.u), **attrs)
@@ -752,6 +754,33 @@ if ok > 0:
                   f"{r['fun']:6.3f} {r['tree']:6.3f} {r['green']:6.3f} "
                   f"{r['water']:6.3f} {r['smooth']:7.3f} {ov:5.1f}% {k:5.1f}")
 
+# ---------- 속도 측정 ----------
+print("\n=== 속도 측정 ===")
+random.seed(5)
+a, b = random.sample(list(big), 2)
+print(f"  구간: {nx.shortest_path_length(G, a, b, weight='length')/1000:.1f}km")
+
+t = time.time()
+nx.shortest_path_length(G, a, b, weight="length")
+print(f"  다익스트라 1회   : {time.time()-t:.2f}초")
+
+t = time.time()
+pen = np.zeros(len(LEN))
+for key, w in {"fun": 1}.items():
+    pen += w * (1 - FEAT[key])
+cost = LEN * (1 + pen)
+for e, c in zip(EDGE_LIST, cost):
+    G.edges[e]["cost"] = c
+print(f"  비용 계산 1회    : {time.time()-t:.2f}초")
+
+t = time.time()
+route_capped(G, a, b, {"fun": 1})
+print(f"  route_capped 1회 : {time.time()-t:.2f}초  ← 실제 응답 시간")
+
+t = time.time()
+for nm, pref in PRESETS.items():
+    route_capped(G, a, b, pref)
+print(f"  프리셋 {len(PRESETS)}개 전체 : {time.time()-t:.2f}초")
             
 # ---------- 14. 실제 구간 데모 ----------
 print("\n" + "=" * 70)
