@@ -630,15 +630,24 @@ for i in range(5):
         print(f"  테스트 {i+1}: 실패 — {e}")
 print(f"  성공 {ok}/5")
 
+# 비용 계산용 배열 (한 번만)
+EDGE_LIST = list(G.edges(keys=True))
+LEN  = np.array([G.edges[e]["length"] for e in EDGE_LIST])
+FEAT = {k: np.array([G.edges[e].get(k, 0.5) for e in EDGE_LIST])
+        for k in ["fun", "tree", "green", "water", "smooth", "curve", "grade"]}
+print(f"  비용 배열 준비 완료 ({len(LEN):,}개)")
+
 # ---------- 13. 경로 탐색 검증 ----------
 if ok > 0:
     MAX_DETOUR = 0.30        # 우회 허용 한도 30%
 
     def route(G, a, b, pref, base_len=None):
-        """pref = {속성: 가중치}. 경로와 지표 반환"""
-        for x, y, dd in G.edges(data=True):
-            pen = sum(w * (1 - dd.get(k, 0.5)) for k, w in pref.items())
-            dd["cost"] = dd["length"] * (1 + pen)
+        pen = np.zeros(len(LEN))
+        for key, w in pref.items():
+            pen += w * (1 - FEAT[key])
+        cost = LEN * (1 + pen)
+        for e, c in zip(EDGE_LIST, cost):
+            G.edges[e]["cost"] = c
         p = nx.shortest_path(G, a, b, weight="cost")
         pair = list(zip(p, p[1:]))
         d = sum(G[x][y]["length"] for x, y in pair)
@@ -844,4 +853,3 @@ print("무방향 경로:", nx.has_path(und, a, b))
 print(seg["oneway"].value_counts(dropna=False))
 print("일방통행 비율:", 
       seg["oneway"].astype(str).str.lower().isin(["yes","true","1"]).mean())
-
