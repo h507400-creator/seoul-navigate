@@ -26,6 +26,7 @@ for r in seg.itertuples():
         straight = r.straight_s,
         grade  = r.grade_s,
         rank   = r.road_rank,
+        speed = r.speed_est,
         expwy  = bool(r.is_expwy),
         name   = r.road_name if isinstance(r.road_name, str) else "",
     )
