@@ -40,6 +40,7 @@ HW_RANK = {
     "trunk": 5, "trunk_link": 5, "motorway": 5, "motorway_link": 5,
 }
 
+DEFAULT_KPH = {1: 20, 2: 20, 3: 22, 4: 24, 5: 52}
 # ---------- 공통 함수 ----------
 def to_score(s):
     """0보다 큰 값들끼리만 백분위 순위. 0점은 0으로 유지."""
@@ -311,6 +312,15 @@ print(f"\n매칭 구간 {m.sum():,}/{len(edges):,} ({m.mean()*100:.1f}%) / "
 for c in ["spd_wk", "spd_var", "jam"]:
     edges[c] = edges[c].fillna(byroad[c].median())
 
+edges["speed_est"] = np.where(
+    edges["has_spd"], edges["spd_wk"],
+    edges["road_rank"].map(DEFAULT_KPH).fillna(20))
+
+print(f"\n속도 실측 {edges['has_spd'].mean()*100:.1f}% / 추정 {(~edges['has_spd']).mean()*100:.1f}%")
+print("등급별 실측 속도 중앙값 (기본값 점검용):")
+print(edges[edges["has_spd"]].groupby("road_rank")["spd_wk"].median().round(1))
+print("자동차전용 등급:", edges[edges["is_expwy"]]["road_rank"].value_counts().to_dict())
+
 print(f"\n속성 계산 전체 {(time.time()-t0)/60:.1f}분")
 
 
@@ -369,7 +379,7 @@ ROAD_TYPES = {
         # 서남 (수변·업무)
         "여의대로", "안양천로",
         # 수변
-        "청계천로",],
+        "청계천로"],
 }
 
 FEAT_SET = {
@@ -542,7 +552,7 @@ print(f"  노드 저장: seoul_nodes.gpkg ({len(nodes_out):,}개)")
 
 # ---------- 10-2. 분할 엣지에 점수 붙이기 (경로 탐색용) ----------
 print("\n=== 경로 탐색용 그래프 ===")
-score_cols = ["road_name", "road_rank", "is_expwy",
+score_cols = ["road_name", "road_rank", "is_expwy", "speed_est", "has_spd",
               "curve_s", "straight_s", "grade_s",
               "green_s", "tree_s", "water_s", "culture_s",
               "flow_s", "smooth_s", "stable_s", "spd_wk", "jam",
@@ -560,7 +570,7 @@ cols = [c for c in [
     "id", "u", "v", "road_name", "highway", "length", "road_rank", "oneway",
     "is_expwy", "curve_s", "straight_s", "grade_s", "green_s", "tree_s", "water_s",
     "culture_s", "flow_s", "smooth_s", "stable_s", "spd_wk_s",
-    "spd_wk", "jam", "has_spd", "fun", "fun_type",
+    "spd_wk", "jam", "has_spd", "speed_est", "fun", "fun_type",
 ] + fcols + ["geometry"] if c in edges.columns]
 
 out = edges[cols]
@@ -598,6 +608,7 @@ for r in seg.itertuples():
              curve=r.curve_s, grade=r.grade_s, culture=r.culture_s,
              rank=r.road_rank,
              expwy=r.is_expwy,
+             speed=r.speed_est, 
              name=r.road_name if isinstance(r.road_name, str) else "")
 
     if rev:
@@ -659,6 +670,8 @@ if ok > 0:
                "green":  np.mean([G[x][y]["green"]  for x, y in pair]),
                "water":  np.mean([G[x][y]["water"]  for x, y in pair]),
                "smooth": np.mean([G[x][y]["smooth"] for x, y in pair])}
+        out["min"] = sum(G[x][y]["length"] / (G[x][y]["speed"] / 3.6)
+                         for x, y in pair) / 60
         out["detour"] = (d / base_len - 1) if base_len else 0.0
         return p, out
 
@@ -847,7 +860,7 @@ for region, n1, la1, lo1, n2, la2, lo2 in DEMOS:
         ov = len(s & base_set) / len(s) * 100
 
         print(f"\n  ▸ {nm}")
-        print(f"    거리 {r['km']:.1f}km  (최단 대비 {r['detour']*100:+.0f}%, "
+        print(f"    거리 {r['km']:.1f}km · 약 {r['min']:.0f}분  (최단 대비 {r['detour']*100:+.0f}%, "
               f"{r['km'] - base/1000:+.1f}km)  최단경로와 {ov:.0f}% 동일")
 
         if nm != "최단":
