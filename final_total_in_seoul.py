@@ -91,8 +91,8 @@ osm = OSM(PBF, bounding_box=SEOUL)
 edges = osm.get_network(network_type="driving")
 print(f"원본 {len(edges):,}개 ({time.time()-t0:.0f}초)")
 
-if "tunnel" in edges.columns:
-    edges = edges[edges["tunnel"].isna()]
+edges["is_tunnel"] = edges["tunnel"].notna() if "tunnel" in edges.columns else False
+print(f"  터널 {edges['is_tunnel'].sum():,}개 (경로 탐색에는 사용, 풍경 점수는 0)")
 
 # 자동차전용도로는 데이터에 포함하되 모델 학습에서만 제외
 edges["is_expwy"] = edges["highway"].isin(DROP_HW)
@@ -271,6 +271,8 @@ print(f"  굴곡 완료 ({time.time()-t1:.0f}초)")
 edges["road_rank"] = edges["highway"].map(HW_RANK).fillna(1).astype(int)
 edges["road_name"] = edges["name"].fillna("")
 
+for c in ["green", "water", "tree", "culture"]:
+    edges.loc[edges["is_tunnel"], c] = 0.0
 # ---------- 5-2. 교통 속도 (서울시 차량통행속도) ----------
 SPD_CACHE = os.path.join(BASE, "speed_byroad.csv")
 if os.path.exists(SPD_CACHE):
@@ -424,7 +426,7 @@ print(cmp_.round(3).T)
 
 # ---------- 8. 유형별 모델 ----------
 def train_type(rtype, feats, seed=42, verbose=True):
-    base = edges[(edges["length"] > 50) & (~edges["is_expwy"])]
+    base = edges[(edges["length"] > 50) & (~edges["is_expwy"]) & (~edges["is_tunnel"])]
     pos  = base[base["rtype"] == rtype]
 
     # 속도 변수를 쓰면 데이터 있는 도로끼리만 비교 (데이터 유무 교란 차단)
@@ -518,6 +520,10 @@ fcols = [f"fun_{rt}" for rt in FEAT_SET]
 edges["fun"] = edges[fcols].max(axis=1)
 edges["fun_type"] = edges[fcols].idxmax(axis=1).str[4:]
 
+mask = edges["is_expwy"] | edges["is_tunnel"]
+for col in fcols + ["fun"]:
+    edges.loc[mask, col] = 0.0
+
 lg = edges[(edges["road_name"] != "") & (edges["length"] > 300)]
 for rt in FEAT_SET:
     print(f"\n[{rt} 상위 15 (300m 이상)]")
@@ -552,10 +558,9 @@ print(f"  노드 저장: seoul_nodes.gpkg ({len(nodes_out):,}개)")
 
 # ---------- 10-2. 분할 엣지에 점수 붙이기 (경로 탐색용) ----------
 print("\n=== 경로 탐색용 그래프 ===")
-score_cols = ["road_name", "road_rank", "is_expwy", "speed_est", "has_spd",
-              "curve_s", "straight_s", "grade_s",
-              "green_s", "tree_s", "water_s", "culture_s",
-              "flow_s", "smooth_s", "stable_s", "spd_wk", "jam",
+score_cols = ["road_name", "road_rank", "is_expwy", "is_tunnel", "speed_est", "has_spd",
+              "curve_s", "straight_s", "grade_s", "green_s", "tree_s", "water_s",
+              "culture_s", "flow_s", "smooth_s", "stable_s", "spd_wk", "jam",
               "fun", "fun_type"] + fcols
 score_cols = [c for c in score_cols if c in edges.columns]
 
@@ -568,7 +573,7 @@ print(f"  분할 엣지 {len(seg):,}개 (점수 있는 것만)")
 # ---------- 11. 인계 저장 ----------
 cols = [c for c in [
     "id", "u", "v", "road_name", "highway", "length", "road_rank", "oneway",
-    "is_expwy", "curve_s", "straight_s", "grade_s", "green_s", "tree_s", "water_s",
+    "is_expwy","is_tunnel", "curve_s", "straight_s", "grade_s", "green_s", "tree_s", "water_s",
     "culture_s", "flow_s", "smooth_s", "stable_s", "spd_wk_s",
     "spd_wk", "jam", "has_spd", "speed_est", "fun", "fun_type",
 ] + fcols + ["geometry"] if c in edges.columns]
@@ -579,7 +584,7 @@ print(f"\n인계 파일: seoul_edges_final.gpkg ({len(out):,}행 × {len(cols)}�
 print("컬럼:", cols)
 
 # 경로 탐색용 분할 파일
-seg_cols = [c for c in ["id", "u", "v", "oneway", "highway", "length"]
+seg_cols = [c for c in ["id", "u", "v", "oneway", "highway", "junction", "length"]
             + score_cols + ["geometry"] if c in seg.columns]
 seg[seg_cols].to_file(os.path.join(BASE, "seoul_segments_final.gpkg"),
                       driver="GPKG")
@@ -591,35 +596,90 @@ import random
 
 print("\n=== 그래프 복원 테스트 ===")
 G = nx.DiGraph()
-n_one = n_rev = 0
+
+def add_short(u, v, attrs):
+    """같은 두 교차로 사이에 도로가 여러 개면 짧은 쪽을 남김"""
+    if G.has_edge(u, v) and G[u][v]["length"] <= attrs["length"]:
+        return
+    G.add_edge(u, v, **attrs)
+
+n_one = n_rev = n_implied = 0
 for r in seg.itertuples():
-    ow = getattr(r, "oneway", None)
-    if isinstance(ow, bool):
-        one, rev = ow, False
-    else:
-        s_ = str(ow).strip().lower()
-        rev = (s_ == "-1")
-        one = s_ in ("yes", "true", "1") or rev
+    s_  = str(getattr(r, "oneway", "")).strip().lower()
+    hw  = str(getattr(r, "highway", ""))
+    jct = str(getattr(r, "junction", ""))
+
+    rev = (s_ == "-1")
+    one = s_ in ("yes", "true", "1") or rev
+    # OSM 규칙: oneway 빈칸이어도 고속도로·램프·회전교차로는 일방통행
+    if s_ in ("nan", "none", "") and (hw in ("motorway", "motorway_link") or jct == "roundabout"):
+        one = True
+        n_implied += 1
     n_one += one
     n_rev += rev
 
-    attrs = dict(length=r.length, fun=r.fun, tree=r.tree_s,
-             green=r.green_s, smooth=r.smooth_s, water=r.water_s,
-             curve=r.curve_s, grade=r.grade_s, culture=r.culture_s,
-             rank=r.road_rank,
-             expwy=r.is_expwy,
-             speed=r.speed_est, 
-             name=r.road_name if isinstance(r.road_name, str) else "")
+    attrs = dict(
+        length  = r.length,
+        fun     = r.fun,
+        tree    = r.tree_s,
+        green   = r.green_s,
+        water   = r.water_s,
+        culture = r.culture_s,
+        smooth  = r.smooth_s,
+        way     = int(r.id),
+        curve   = r.curve_s,
+        straight = r.straight_s,
+        grade   = r.grade_s,
+        speed   = r.speed_est,
+        rank    = r.road_rank,
+        expwy   = bool(r.is_expwy),
+        tunnel  = bool(r.is_tunnel),
+        name    = r.road_name if isinstance(r.road_name, str) else "",
+    )
 
     if rev:
-        G.add_edge(int(r.v), int(r.u), **attrs)
+        add_short(int(r.v), int(r.u), attrs)
     else:
-        G.add_edge(int(r.u), int(r.v), **attrs)
+        add_short(int(r.u), int(r.v), attrs)
         if not one:
-            G.add_edge(int(r.v), int(r.u), **attrs)
+            add_short(int(r.v), int(r.u), attrs)
+
+# ---- 회전 제한 반영: 제한 있는 교차로만 진입 방향별로 쪼갬 ----
+rst = pd.read_csv(os.path.join(BASE, "restrictions.csv"))
+NO_TURN = {(int(f), int(v), int(t)) for k, f, v, t in rst.itertuples(index=False) if k.startswith("no_")}
+ONLY_TURN = {}
+for k, f, v, t in rst.itertuples(index=False):
+    if k.startswith("only_"):
+        ONLY_TURN.setdefault((int(f), int(v)), set()).add(int(t))
+
+def turn_ok(w_in, y, w_out):
+    if (w_in, y, w_out) in NO_TURN:
+        return False
+    if (w_in, y) in ONLY_TURN and w_out not in ONLY_TURN[(w_in, y)]:
+        return False
+    return True
+
+VIA = ({v for _, v, _ in NO_TURN} | {v for _, v in ONLY_TURN}) & set(G.nodes)
+n_split = n_block = 0
+for y in VIA:
+    ins  = list(G.in_edges(y, data=True))
+    outs = list(G.out_edges(y, data=True))
+    for x, _, din in ins:
+        vy = ("t", y, x)                       # x에서 들어온 교차로 y
+        G.add_edge(x, vy, **din)
+        for _, z, dout in outs:
+            if turn_ok(din["way"], y, dout["way"]):
+                G.add_edge(vy, z, **dout)
+            else:
+                n_block += 1
+        G.remove_edge(x, y)
+        n_split += 1
+print(f"  회전 제한 교차로 {len(VIA):,}개 / 진입 방향 {n_split:,}개로 분리 / 막은 회전 {n_block:,}개")
 
 print(f"  노드 {G.number_of_nodes():,} / 엣지 {G.number_of_edges():,}")
-print(f"  일방통행 {n_one:,} ({n_one/len(seg)*100:.1f}%) / 역방향 {n_rev}")
+print(f"  일방통행 {n_one:,} ({n_one/len(seg)*100:.1f}%) / 역방향 {n_rev} / "
+      f"규칙으로 일방통행 처리 {n_implied:,}")
+print(f"  터널 엣지 {sum(1 for *_, d in G.edges(data=True) if d['tunnel']):,}개")
 
 und = G.to_undirected()
 wcc = max(nx.connected_components(und), key=len)
@@ -627,8 +687,7 @@ print(f"  약한 연결 {len(wcc):,}개 ({len(wcc)/G.number_of_nodes()*100:.1f}%
 
 scc = max(nx.strongly_connected_components(G), key=len)
 print(f"  강한 연결 {len(scc):,}개 ({len(scc)/G.number_of_nodes()*100:.1f}%)")
-
-big = scc        # 경로 탐색은 강한 연결 요소 안에서만
+big = scc
 
 random.seed(0)
 ok = 0
@@ -643,13 +702,11 @@ for i in range(5):
         print(f"  테스트 {i+1}: 실패 — {e}")
 print(f"  성공 {ok}/5")
 
-# 비용 계산용 배열 (한 번만)
 EDGE_LIST = list(G.edges())
 LEN  = np.array([G.edges[e]["length"] for e in EDGE_LIST])
 FEAT = {k: np.array([G.edges[e].get(k, 0.5) for e in EDGE_LIST])
-        for k in ["fun", "tree", "green", "water", "smooth", "curve", "grade"]}
+        for k in ["fun", "tree", "green", "water", "culture", "smooth", "curve", "grade","straight"]}
 print(f"  비용 배열 준비 완료 ({len(LEN):,}개)")
-
 # ---------- 13. 경로 탐색 검증 ----------
 if ok > 0:
     MAX_DETOUR = 0.30        # 우회 허용 한도 30%
@@ -661,7 +718,7 @@ if ok > 0:
         cost = LEN * (1 + pen)
         for e, c in zip(EDGE_LIST, cost):
             G.edges[e]["cost"] = c
-        p = nx.shortest_path(G, a, b, weight="cost")
+        _, p = nx.bidirectional_dijkstra(G, a, b, weight="cost")
         pair = list(zip(p, p[1:]))
         d = sum(G[x][y]["length"] for x, y in pair)
         out = {"km": d / 1000,
@@ -669,7 +726,9 @@ if ok > 0:
                "tree":   np.mean([G[x][y]["tree"]   for x, y in pair]),
                "green":  np.mean([G[x][y]["green"]  for x, y in pair]),
                "water":  np.mean([G[x][y]["water"]  for x, y in pair]),
-               "smooth": np.mean([G[x][y]["smooth"] for x, y in pair])}
+               "smooth": np.mean([G[x][y]["smooth"] for x, y in pair]),
+               "straight": np.mean([G[x][y]["straight"] for x, y in pair]),
+               "curve":    np.mean([G[x][y]["curve"]    for x, y in pair]),}
         out["min"] = sum(G[x][y]["length"] / (G[x][y]["speed"] / 3.6)
                          for x, y in pair) / 60
         out["detour"] = (d / base_len - 1) if base_len else 0.0
@@ -794,22 +853,27 @@ t = time.time()
 for nm, pref in PRESETS.items():
     route_capped(G, a, b, pref)
 print(f"  프리셋 {len(PRESETS)}개 전체 : {time.time()-t:.2f}초")
-            
 # ---------- 14. 실제 구간 데모 ----------
 print("\n" + "=" * 70)
 print("실제 구간 경로 데모")
 print("=" * 70)
 
 DEMOS = [
-    ("북악 일대",   "경복궁",      37.5796, 126.9770, "정릉",        37.6100, 127.0100),
+    ("북악 일대",   "경복궁",      37.5796, 126.9770, "정릉",        37.6025, 127.0057),
     ("강남 일대",   "강남역",      37.4979, 127.0276, "양재시민의숲", 37.4705, 127.0380),
     ("한강 북단",   "여의도공원",   37.5265, 126.9242, "반포한강공원",  37.5100, 126.9960),
     ("광진·성동",  "건대입구역",   37.5405, 127.0700, "서울숲",      37.5444, 127.0374),
 ]
 
 # 연결 요소 안의 노드만 후보로
+ok_nodes = set()
+for x, y, d in G.edges(data=True):
+    if not d.get("expwy", False) and not d.get("tunnel", False):
+        ok_nodes.update([n for n in (x, y) if isinstance(n, int)])
+ok_nodes -= VIA
+
 nd_ll   = nodes_g.set_index("id")[["lon", "lat"]]
-nd_big  = nd_ll[nd_ll.index.isin(big)]
+nd_big  = nd_ll[nd_ll.index.isin(big) & nd_ll.index.isin(ok_nodes)]
 arr_big = nd_big.values
 ids_big = nd_big.index.values
 print(f"후보 노드 {len(nd_big):,}개")
@@ -895,3 +959,43 @@ print("무방향 경로:", nx.has_path(und, a, b))
 print(seg["oneway"].value_counts(dropna=False))
 print("일방통행 비율:", 
       seg["oneway"].astype(str).str.lower().isin(["yes","true","1"]).mean())
+
+# ---------- 회전 제한 위반 검사 ----------
+import pandas as pd
+rst = pd.read_csv(os.path.join(BASE, "restrictions.csv"))
+no_turn  = {(r.from_way, r.via_node, r.to_way) for r in rst.itertuples() if r.kind.startswith("no_")}
+only_turn = {}
+for r in rst.itertuples():
+    if r.kind.startswith("only_"):
+        only_turn.setdefault((r.from_way, r.via_node), set()).add(r.to_way)
+
+def violations(p):
+    bad = []
+    for x, y, z in zip(p, p[1:], p[2:]):
+        yo = y[1] if isinstance(y, tuple) else y
+        w1, w2 = G[x][y]["way"], G[y][z]["way"]
+        if w1 != w2 and not turn_ok(w1, yo, w2):
+            bad.append(("위반", yo))
+    return bad
+TESTS = [
+    ("건대입구역 → 서울숲",       37.5405, 127.0700, 37.5444, 127.0374),
+    ("강남역 → 양재시민의숲",      37.4979, 127.0276, 37.4705, 127.0380),
+    ("서울역 → 압구정역",         37.5547, 126.9707, 37.5270, 127.0284),
+    ("신촌역 → 잠실역",           37.5552, 126.9369, 37.5133, 127.1001),
+    ("여의도역 → 고속터미널역",    37.5216, 126.9243, 37.5049, 127.0049),
+    ("경복궁역 → 정릉",           37.5759, 126.9735, 37.6025, 127.0057),
+]
+CHECK = [("직선길", "straight"), ("곡선길", "curve"), ("볼거리", "culture")]
+print(f"\n[회전 제한 위반 검사]  서울 제한 {len(rst):,}개")
+total_paths = total_bad = 0
+for nm, la1, lo1, la2, lo2 in TESTS:
+    a, b = nearest_node(la1, lo1), nearest_node(la2, lo2)
+    base = nx.shortest_path_length(G, a, b, weight="length")
+    for label, pref in [("최단", {})] + [(l, {k: 1}) for l, k in CHECK] + \
+                       [("공원길", {"green": 1}), ("강변길", {"water": 1}), ("숲길", {"fun": 1})]:
+        p = route(G, a, b, {}, base)[0] if not pref else route_capped(G, a, b, pref)[0]
+        bad = violations(p)
+        total_paths += 1; total_bad += bool(bad)
+        if bad:
+            print(f"  ✗ {nm} {label}: {len(bad)}건 (노드 {[n for _, n in bad][:3]})")
+print(f"\n  위반 있는 경로 {total_bad}/{total_paths}개")
