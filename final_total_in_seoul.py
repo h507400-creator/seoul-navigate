@@ -182,21 +182,35 @@ print(f"신호 교차로 {len(signals):,}개")
 # ---------- 4. 경사 ----------
 print("\n=== 경사 ===")
 t0 = time.time()
-ends = edges.geometry.apply(lambda g: (g.coords[0], g.coords[-1]))
-p0 = gpd.GeoSeries(gpd.points_from_xy([c[0][0] for c in ends],
-                                      [c[0][1] for c in ends]), crs=CRS_M).to_crs(4326)
-p1 = gpd.GeoSeries(gpd.points_from_xy([c[1][0] for c in ends],
-                                      [c[1][1] for c in ends]), crs=CRS_M).to_crs(4326)
-e0 = dem_elevation(p0.x.values, p0.y.values)
-e1 = dem_elevation(p1.x.values, p1.y.values)
-diff = np.abs(e0 - e1)
-edges["grade"] = np.where(np.isnan(diff), 0.0, diff / edges["length"].values)
-edges.loc[edges["length"] < 30, "grade"] = 0.0
-edges["grade"] = edges["grade"].clip(0, 0.20)
-allz = np.concatenate([e0, e1])
-print(f"고도 {np.nanmin(allz):.0f}~{np.nanmax(allz):.0f}m "
-      f"(결측 {np.isnan(allz).mean()*100:.1f}%)")
-print(f"평균 경사 {edges['grade'].mean()*100:.2f}% ({time.time()-t0:.0f}초)")
+# DEM(약 30m, 건물·나무 포함 표면고도)은 그대로 쓰면 평지(여의도)도 평균 4%가 나올 만큼 노이즈가 큼.
+#  1) 음수·결측은 가까운 값으로 채우고  2) 9픽셀 중앙값 + 가우시안으로 건물·나무 돌출 제거
+#  3) 도로를 따라 20m 간격으로 고도를 읽어 누적 오르내림/길이  4) 평지 노이즈 3%를 빼고  5) 다리·터널은 0
+from scipy import ndimage
+from pyproj import Transformer
+GRADE_STEP, GRADE_FLOOR = 20, 0.03
+with rasterio.open(DEM_F) as src:
+    Z = src.read(1).astype(float); dem_inv = ~src.transform
+    Z[(Z == src.nodata) | (Z < 0) | (Z > 2000)] = np.nan
+Z = Z[tuple(ndimage.distance_transform_edt(np.isnan(Z), return_distances=False, return_indices=True))]
+Z = ndimage.gaussian_filter(ndimage.median_filter(Z, size=9), 1)
+gx, gy, gid = [], [], []
+for i, g in enumerate(edges.geometry.values):
+    n = max(int(g.length // GRADE_STEP), 1)
+    for k in range(n + 1):
+        p = g.interpolate(k / n, normalized=True); gx.append(p.x); gy.append(p.y); gid.append(i)
+lon, lat = Transformer.from_crs(CRS_M, 4326, always_xy=True).transform(np.array(gx), np.array(gy))
+col, row = dem_inv * (lon, lat)
+zp = ndimage.map_coordinates(Z, [row - 0.5, col - 0.5], order=1, mode="nearest")
+prof = pd.DataFrame({"i": gid, "z": zp})
+dz = prof["z"].diff().abs()
+dz[prof["i"].ne(prof["i"].shift())] = 0.0
+climb = dz.groupby(prof["i"]).sum().reindex(range(len(edges)), fill_value=0).values
+edges["grade"] = (climb / edges["length"].values - GRADE_FLOOR).clip(0, 0.20)
+is_bridge = edges["bridge"].notna() & (edges["bridge"].astype(str) != "no") if "bridge" in edges.columns else False
+edges.loc[edges["is_tunnel"] | is_bridge, "grade"] = 0.0
+print(f"고도 {np.nanmin(zp):.0f}~{np.nanmax(zp):.0f}m (평활 DEM, 샘플 {len(zp):,}점)")
+print(f"평균 경사 {edges['grade'].mean()*100:.2f}% / 0 아닌 비율 {(edges['grade'] > 0).mean()*100:.0f}% "
+      f"({time.time()-t0:.0f}초)")
 
 # ---------- 5. 속성 계산 ----------
 print("\n=== 속성 계산 ===")
@@ -302,8 +316,26 @@ else:
 print(f"\n속도 데이터 도로 {len(byroad)}개")
 print(byroad.describe().round(2).to_string())
 
+# 서울시 도로명 → OSM 도로명 매칭 키
+#  - 이름이 다른 도로는 별칭으로 연결 (동부간선도로 = OSM 동부간선로)
+#  - 같은 이름이 두 곳에 있는 양산로는 위치로 나눔 (경도 127.0 동쪽 = 송파, 서쪽 = 영등포)
+#  - 이면도로(residential 등)는 이름이 '~길'일 때만 매칭: 간선 이름을 공유하는 골목에 간선 속도가 붙는 것 방지
+SPD_ALIAS = {"동부간선도로": "동부간선로"}
+byroad = byroad.rename(index=SPD_ALIAS)
+spd_key = edges["road_name"].copy()
+ysan = spd_key == "양산로"
+if ysan.any():
+    ylon = edges.loc[ysan].geometry.centroid.to_crs(4326).x
+    spd_key[ysan] = np.where(ylon > 127.0, "양산로(송파)", "양산로(영등포)")
+MINOR_HW = ["residential", "living_street", "unclassified", "service", "road"]
+is_minor = edges["highway"].isin(MINOR_HW)
+main_names = set(spd_key[~is_minor])                 # 같은 이름의 간선 구간이 있는 경우에만 이면도로를 뺌
+overmatch = is_minor & ~spd_key.str.endswith("길") & spd_key.isin(byroad.index) & spd_key.isin(main_names)
+spd_key[overmatch] = ""
+print(f"속도 매칭 제외(간선 이름을 쓰는 이면도로) {overmatch.sum():,}개 "
+      f"({edges.loc[overmatch, 'length'].sum()/1000:.0f}km)")
 for c in ["spd_wk", "spd_var", "jam"]:
-    edges[c] = edges["road_name"].map(byroad[c])
+    edges[c] = spd_key.map(byroad[c])
 
 edges["has_spd"] = edges["spd_wk"].notna()
 m = edges["has_spd"]
@@ -564,11 +596,34 @@ score_cols = ["road_name", "road_rank", "is_expwy", "is_tunnel", "speed_est", "h
               "fun", "fun_type"] + fcols
 score_cols = [c for c in score_cols if c in edges.columns]
 
-seg = edges_g.merge(edges[["id"] + score_cols], on="id", how="inner")
+# 경로망은 10m 필터 이전의 전체 도로로 만든다 (짧은 연결로가 빠지면 막다른 길이 생김)
+seg = edges_g.merge(edges[["id"] + score_cols], on="id", how="left")
 seg = seg.to_crs(CRS_M)
 seg["length"] = seg.geometry.length
 seg = seg[seg["length"] > 0].reset_index(drop=True)
-print(f"  분할 엣지 {len(seg):,}개 (점수 있는 것만)")
+short = seg["fun"].isna() if "fun" in seg.columns else seg["road_rank"].isna()
+if short.any():
+    # 점수 없는 짧은 연결로: 속성은 태그로, 점수는 양 끝에 붙은 도로들의 평균으로 채움
+    seg.loc[short, "road_name"] = seg.loc[short, "name"].fillna("") if "name" in seg.columns else ""
+    seg.loc[short, "road_rank"] = seg.loc[short, "highway"].map(HW_RANK).fillna(1)
+    seg.loc[short, "is_expwy"] = seg.loc[short, "highway"].isin(DROP_HW)
+    seg.loc[short, "is_tunnel"] = seg.loc[short, "tunnel"].notna() if "tunnel" in seg.columns else False
+    seg.loc[short, "has_spd"] = False
+    seg.loc[short, "speed_est"] = seg.loc[short, "road_rank"].map(DEFAULT_KPH).fillna(20)
+    if "fun_type" in seg.columns: seg.loc[short, "fun_type"] = ""
+    numc = [c for c in score_cols if c not in ("road_name", "road_rank", "is_expwy", "is_tunnel",
+                                               "speed_est", "has_spd", "fun_type")]
+    known = seg.loc[~short]
+    nmean = pd.concat([known[["u"] + numc].rename(columns={"u": "n"}),
+                       known[["v"] + numc].rename(columns={"v": "n"})]).groupby("n")[numc].mean()
+    for c in numc:
+        a = seg.loc[short, "u"].map(nmean[c]); b = seg.loc[short, "v"].map(nmean[c])
+        seg.loc[short, c] = pd.concat([a, b], axis=1).mean(axis=1).fillna(0.0)
+    fz = [c for c in numc if c.startswith("fun")]
+    seg.loc[short & (seg["is_expwy"].astype(bool) | seg["is_tunnel"].astype(bool)), fz] = 0.0
+    seg["road_rank"] = seg["road_rank"].astype(int)
+    for c in ("is_expwy", "is_tunnel", "has_spd"): seg[c] = seg[c].astype(bool)
+print(f"  분할 엣지 {len(seg):,}개 (짧은 연결로 {short.sum():,}개 포함, way {seg.loc[short, 'id'].nunique():,}개)")
 
 # ---------- 11. 인계 저장 ----------
 cols = [c for c in [
