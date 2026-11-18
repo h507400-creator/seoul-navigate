@@ -612,7 +612,9 @@ for r in seg.itertuples():
     rev = (s_ == "-1")
     one = s_ in ("yes", "true", "1") or rev
     # OSM 규칙: oneway 빈칸이어도 고속도로·램프·회전교차로는 일방통행
-    if s_ in ("nan", "none", "") and (hw in ("motorway", "motorway_link") or jct == "roundabout"):
+    #  (trunk_link = 도시고속도로 램프, circular = 회전교차로의 다른 태그)
+    if s_ in ("nan", "none", "") and (hw in ("motorway", "motorway_link", "trunk_link")
+                                      or jct in ("roundabout", "circular")):
         one = True
         n_implied += 1
     n_one += one
