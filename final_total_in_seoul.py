@@ -91,6 +91,16 @@ osm = OSM(PBF, bounding_box=SEOUL)
 edges = osm.get_network(network_type="driving")
 print(f"원본 {len(edges):,}개 ({time.time()-t0:.0f}초)")
 
+# OSM 일방통행 방향 오류 보정 (reversed_scan.py로 찾고 로드뷰로 확인한 것만)
+#  문성로(신림동 서향약국 서쪽 약 220m) 남쪽 차로가 서쪽 방향으로 잘못 입력됨 → 실제는 동쪽 방향
+#  way 방향을 뒤집는 대신 oneway=-1로 바꿔 주행 방향만 반대로 함
+ONEWAY_FIX = {470202034: "-1", 1437075625: "-1"}
+def fix_oneway(df):
+    hit = df["id"].isin(ONEWAY_FIX)
+    df.loc[hit, "oneway"] = df.loc[hit, "id"].map(ONEWAY_FIX)
+    return int(hit.sum())
+print(f"  일방통행 방향 보정 {fix_oneway(edges)}개 way")
+
 edges["is_tunnel"] = edges["tunnel"].notna() if "tunnel" in edges.columns else False
 print(f"  터널 {edges['is_tunnel'].sum():,}개 (경로 탐색에는 사용, 풍경 점수는 0)")
 
@@ -576,6 +586,7 @@ print("\n=== 노드 연결 정보 ===")
 t0 = time.time()
 nodes_g, edges_g = osm.get_network(network_type="driving", nodes=True)
 print(f"  노드 {len(nodes_g):,} / 분할 엣지 {len(edges_g):,} ({time.time()-t0:.0f}초)")
+print(f"  일방통행 방향 보정 {fix_oneway(edges_g)}개 구간")
 
 # OSM way id 기준으로 시작·끝 노드 추출
 uv = edges_g.groupby("id").agg(u=("u", "first"), v=("v", "last"))
